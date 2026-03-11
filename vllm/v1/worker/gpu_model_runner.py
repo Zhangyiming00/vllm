@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -430,6 +431,13 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+
+        # Activation capture mode: prefill-only, minimal KV cache, no CUDA
+        # graphs. Enabled via VLLM_ACTIVATION_CAPTURE_MODE=1 env var.
+        # Used by SAELens HookedVLLMModel for hook-based activation extraction.
+        self.activation_capture_mode: bool = (
+            os.environ.get("VLLM_ACTIVATION_CAPTURE_MODE", "0") == "1"
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -3748,6 +3756,11 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
+
+        # In activation capture mode, always use eager execution so that
+        # per-layer PyTorch forward hooks fire correctly.
+        if self.activation_capture_mode:
+            cudagraph_mode = CUDAGraphMode.NONE
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.

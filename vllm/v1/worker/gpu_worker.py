@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import gc
+import math
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -359,6 +360,26 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if os.environ.get("VLLM_ACTIVATION_CAPTURE_MODE", "0") == "1":
+            self.model_runner.profile_run()
+            kv_specs = self.model_runner.get_kv_cache_spec()
+            if not kv_specs:
+                return 1  # Attention-free model
+            first_spec = next(iter(kv_specs.values()))
+            block_size = first_spec.block_size
+            max_batched_tokens = self.scheduler_config.max_num_batched_tokens
+            # One extra block as a safety margin for partial sequences.
+            num_blocks = math.ceil(max_batched_tokens / block_size) + 1
+            total_bytes = sum(
+                num_blocks * spec.page_size_bytes for spec in kv_specs.values()
+            )
+            logger.info(
+                "Activation capture mode: minimal KV cache = %d blocks "
+                "x %d layers = %.1f MiB",
+                num_blocks, len(kv_specs), total_bytes / (1024 * 1024),
+            )
+            return max(total_bytes, 1)
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens

@@ -440,6 +440,9 @@ class Qwen2Model(nn.Module):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
+            _stop = getattr(self, "_sae_stop_at_layer", None)
+            if _stop is not None and self.start_layer + idx + 1 >= _stop:
+                break
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

@@ -426,6 +426,9 @@ class LlamaModel(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, residual, **extra_layer_kwargs
             )
+            _stop = getattr(self, "_sae_stop_at_layer", None)
+            if _stop is not None and self.start_layer + idx + 1 >= _stop:
+                break
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
