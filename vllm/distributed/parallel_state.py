@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -73,6 +74,16 @@ class Handle(Protocol):
     def is_completed(self) -> bool: ...
 
     def wait(self) -> None: ...
+
+
+_SAELENS_VLLM_WORLD_RANKS_ENV = "SAELENS_VLLM_WORLD_RANKS"
+
+
+def _get_saelens_world_ranks() -> list[int] | None:
+    raw_ranks = os.environ.get(_SAELENS_VLLM_WORLD_RANKS_ENV)
+    if raw_ranks is None or raw_ranks == "":
+        return None
+    return [int(rank) for rank in raw_ranks.split(",")]
 
 
 def _split_tensor_dict(
@@ -347,13 +358,37 @@ class GroupCoordinator:
                 self_device_group = device_group
                 self_cpu_group = cpu_group
 
-        assert self_cpu_group is not None
-        assert self_device_group is not None
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda_alike():
+            device = torch.device(f"cuda:{local_rank}")
+        elif current_platform.is_xpu():
+            device = torch.device(f"xpu:{local_rank}")
+        elif current_platform.is_out_of_tree():
+            device = torch.device(f"{current_platform.device_name}:{local_rank}")
+        else:
+            device = torch.device("cpu")
+
+        if self_cpu_group is None:
+            # This rank is not a member of any group in group_ranks.
+            # Non-member ranks must still call dist.new_group() to satisfy
+            # PyTorch's collective barrier, but they don't join any group.
+            # Store a null coordinator so callers can detect non-membership.
+            self.ranks = []
+            self.world_size = 0
+            self.rank_in_group = -1
+            self.cpu_group = None  # type: ignore[assignment]
+            self.device_group = None  # type: ignore[assignment]
+            self.device = device
+            self.use_device_communicator = False
+            self.device_communicator = None
+            self.mq_broadcaster = None
+            self.use_custom_op_call = False
+            self.use_cpu_custom_send_recv = False
+            return
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
-
-        from vllm.platforms import current_platform
 
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
@@ -1161,6 +1196,75 @@ def init_model_parallel_group(
     )
 
 
+def preinit_vllm_parallel_state(
+    vllm_world_ranks: list[int],
+    vllm_tp_size: int,
+    local_rank: int,
+    backend: str = "nccl",
+) -> None:
+    """Pre-initialize vLLM parallel state on ALL torchrun ranks.
+
+    Must be called on every rank *before* any rank constructs LLM().
+    Non-member ranks (not in vllm_world_ranks) participate in each
+    dist.new_group() barrier call but receive null GroupCoordinators.
+    Member ranks receive real GroupCoordinators stored in the module globals.
+
+    After this call, LLM() construction detects _WORLD/_TP/_PP already set
+    and skips its own group creation, preventing deadlocks when
+    sae_tp_size > vllm_tp_size (split roles).
+
+    Assumes pp=1, dp=1 (the only topology SAELens uses with split roles).
+    """
+    global _WORLD, _TP, _DCP, _PCP, _PP, _DP
+
+    assert _WORLD is None, "vLLM parallel state already initialized"
+    assert torch.distributed.is_initialized()
+
+    # With pp=1 and dp=1, there is exactly one TP group containing all vLLM ranks.
+    tp_group_ranks: list[list[int]] = [
+        vllm_world_ranks[i : i + vllm_tp_size]
+        for i in range(0, len(vllm_world_ranks), vllm_tp_size)
+    ]
+
+    # Replicate the exact group creation order of init_distributed_environment
+    # + initialize_model_parallel(tp=vllm_tp_size, pp=1, pcp=1, dcp=1, dp=1).
+    # All dist.new_group() calls are collective barriers — every world rank
+    # must participate, including non-member SAE-only ranks.
+    _WORLD = init_world_group(vllm_world_ranks, local_rank, backend)
+    _TP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="tp",
+    )
+    _DCP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="dcp",
+    )
+    _PCP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        group_name="pcp",
+    )
+    _PP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        group_name="pp",
+    )
+    _DP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        group_name="dp",
+    )
+
+
 def _init_stateless_group(
     group_ranks: list[list[int]],
     group_name: str,
@@ -1444,8 +1548,13 @@ def init_distributed_environment(
     if enable_elastic_ep:
         _init_elastic_ep_world(config, local_rank, backend, rank, world_size)
         return
+    saelens_world_ranks = _get_saelens_world_ranks()
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
+        ranks = (
+            saelens_world_ranks
+            if saelens_world_ranks is not None
+            else list(range(torch.distributed.get_world_size()))
+        )
         _WORLD = init_world_group(ranks, local_rank, backend)
         if config is not None and config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes
@@ -1453,7 +1562,12 @@ def init_distributed_environment(
             _NODE_COUNT = _node_count(_WORLD.cpu_group)
         logger.debug("Detected %d nodes in the distributed environment", _NODE_COUNT)
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+        expected_world_size = (
+            len(saelens_world_ranks)
+            if saelens_world_ranks is not None
+            else torch.distributed.get_world_size()
+        )
+        assert _WORLD.world_size == expected_world_size, (
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
@@ -1529,10 +1643,11 @@ def initialize_model_parallel(
             tensor_model_parallel_size,
         )
     else:
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
+        world_group = get_world_group()
+        world_size = world_group.world_size
+        rank = world_group.rank
         backend = backend or torch.distributed.get_backend(
-            get_world_group().device_group
+            world_group.device_group
         )
 
     # the layout order is: ExternalDP x DP x PP x TP
@@ -1544,7 +1659,7 @@ def initialize_model_parallel(
     # otherwise it will cause deadlock.
     # to get group_ranks for each dimension, transpose that dimension to the
     # last dimension, then reshape to 2D, then unbind the last dimension
-    all_ranks = torch.arange(world_size).reshape(
+    all_ranks = torch.tensor(get_world_group().ranks, dtype=torch.long).reshape(
         -1,
         data_parallel_size,
         pipeline_model_parallel_size,
