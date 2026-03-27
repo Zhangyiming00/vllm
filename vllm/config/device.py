@@ -47,6 +47,8 @@ class DeviceConfig:
         return hash_str
 
     def __post_init__(self):
+        explicit_device: torch.device | None = None
+
         if self.device == "auto":
             # Automated device type detection
             from vllm.platforms import current_platform
@@ -61,13 +63,19 @@ class DeviceConfig:
         else:
             # Device type is assigned explicitly
             if isinstance(self.device, str):
-                self.device_type = self.device
+                explicit_device = torch.device(self.device)
+                self.device_type = explicit_device.type
             elif isinstance(self.device, torch.device):
+                explicit_device = self.device
                 self.device_type = self.device.type
 
         # Some device types require processing inputs on CPU
         if self.device_type in ["tpu"]:
             self.device = None
         else:
-            # Set device with device type
-            self.device = torch.device(self.device_type)
+            # Preserve the full explicit device (e.g. cuda:1) when provided.
+            # vLLM's execution path still keys off ``device_type`` for platform
+            # checks, but the concrete worker / load device must retain the
+            # ordinal to avoid loading weights on one GPU and running inputs on
+            # another.
+            self.device = explicit_device or torch.device(self.device_type)

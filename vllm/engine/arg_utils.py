@@ -379,6 +379,7 @@ class EngineArgs:
     download_dir: str | None = LoadConfig.download_dir
     safetensors_load_strategy: str = LoadConfig.safetensors_load_strategy
     load_format: str | LoadFormats = LoadConfig.load_format
+    device: str | None = LoadConfig.device
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
@@ -1418,6 +1419,7 @@ class EngineArgs:
             download_dir=self.download_dir,
             safetensors_load_strategy=self.safetensors_load_strategy,
             model_loader_extra_config=self.model_loader_extra_config,
+            device=self.device,
             ignore_patterns=self.ignore_patterns,
             use_tqdm_on_load=self.use_tqdm_on_load,
             pt_load_map_location=self.pt_load_map_location,
@@ -1462,7 +1464,13 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
-        device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+        resolved_device: Device | torch.device
+        if self.device is None:
+            resolved_device = cast(Device, current_platform.device_type)
+        else:
+            resolved_device = torch.device(self.device)
+
+        device_config = DeviceConfig(device=resolved_device)
 
         envs.validate_environ(self.fail_on_environ_validation)
 
