@@ -1225,6 +1225,8 @@ def preinit_vllm_parallel_state(
         vllm_world_ranks[i : i + vllm_tp_size]
         for i in range(0, len(vllm_world_ranks), vllm_tp_size)
     ]
+    # pp=1, dp=1: each rank is its own pipeline/data group.
+    pp_dp_group_ranks: list[list[int]] = [[r] for r in vllm_world_ranks]
 
     # Replicate the exact group creation order of init_distributed_environment
     # + initialize_model_parallel(tp=vllm_tp_size, pp=1, pcp=1, dcp=1, dp=1).
@@ -1239,26 +1241,26 @@ def preinit_vllm_parallel_state(
         group_name="tp",
     )
     _DCP = init_model_parallel_group(
-        tp_group_ranks,
+        pp_dp_group_ranks,
         local_rank,
         backend,
         use_message_queue_broadcaster=True,
         group_name="dcp",
     )
     _PCP = init_model_parallel_group(
-        tp_group_ranks,
+        pp_dp_group_ranks,
         local_rank,
         backend,
         group_name="pcp",
     )
     _PP = init_model_parallel_group(
-        tp_group_ranks,
+        pp_dp_group_ranks,
         local_rank,
         backend,
         group_name="pp",
     )
     _DP = init_model_parallel_group(
-        tp_group_ranks,
+        pp_dp_group_ranks,
         local_rank,
         backend,
         group_name="dp",
