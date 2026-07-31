@@ -367,16 +367,30 @@ class Worker(WorkerBase):
                 return 1  # Attention-free model
             first_spec = next(iter(kv_specs.values()))
             block_size = first_spec.block_size
-            max_batched_tokens = self.scheduler_config.max_num_batched_tokens
+            # Prefer sizing the minimal KV pool to the ACTUAL activation-capture
+            # workload (batch_size * context_size), so the whole batch's KV can
+            # reside at once without preemption. SAELens passes these via
+            # additional_config; fall back to max_num_batched_tokens when they
+            # are absent (e.g. plain vLLM use of capture mode).
+            additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+            capture_batch_size = additional_config.get("sae_capture_batch_size")
+            capture_context_size = additional_config.get("sae_capture_context_size")
+            if capture_batch_size and capture_context_size:
+                required_tokens = int(capture_batch_size) * int(capture_context_size)
+                sizing_basis = "batch_size * context_size"
+            else:
+                required_tokens = self.scheduler_config.max_num_batched_tokens
+                sizing_basis = "max_num_batched_tokens"
             # One extra block as a safety margin for partial sequences.
-            num_blocks = math.ceil(max_batched_tokens / block_size) + 1
+            num_blocks = math.ceil(required_tokens / block_size) + 1
             total_bytes = sum(
                 num_blocks * spec.page_size_bytes for spec in kv_specs.values()
             )
             logger.info(
                 "Activation capture mode: minimal KV cache = %d blocks "
-                "x %d layers = %.1f MiB",
+                "x %d layers = %.1f MiB (sized by %s = %d tokens)",
                 num_blocks, len(kv_specs), total_bytes / (1024 * 1024),
+                sizing_basis, required_tokens,
             )
             return max(total_bytes, 1)
 
