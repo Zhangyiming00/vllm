@@ -165,7 +165,23 @@ class EngineCoreClient(ABC):
     def execute_dummy_batch(self) -> None:
         raise NotImplementedError
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        raise NotImplementedError
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        raise NotImplementedError
+
     async def execute_dummy_batch_async(self) -> None:
+        raise NotImplementedError
+
+    async def get_cold_reconfigure_status_async(self) -> dict[str, object]:
+        raise NotImplementedError
+
+    async def set_active_max_num_batched_tokens_async(
+        self, value: int
+    ) -> dict[str, object]:
         raise NotImplementedError
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -331,6 +347,14 @@ class InprocClient(EngineCoreClient):
 
     def execute_dummy_batch(self) -> None:
         self.engine_core.execute_dummy_batch()
+
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        return self.engine_core.get_cold_reconfigure_status()
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        return self.engine_core.set_active_max_num_batched_tokens(value)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine_core.add_lora(lora_request)
@@ -881,6 +905,14 @@ class SyncMPClient(MPClient):
     def execute_dummy_batch(self) -> None:
         self.call_utility("execute_dummy_batch")
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        return self.call_utility("get_cold_reconfigure_status")
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        return self.call_utility("set_active_max_num_batched_tokens", value)
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -1116,6 +1148,16 @@ class AsyncMPClient(MPClient):
 
     async def execute_dummy_batch_async(self) -> None:
         await self.call_utility_async("execute_dummy_batch")
+
+    async def get_cold_reconfigure_status_async(self) -> dict[str, object]:
+        return await self.call_utility_async("get_cold_reconfigure_status")
+
+    async def set_active_max_num_batched_tokens_async(
+        self, value: int
+    ) -> dict[str, object]:
+        return await self.call_utility_async(
+            "set_active_max_num_batched_tokens", value
+        )
 
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         return await self.call_utility_async("add_lora", lora_request)

@@ -186,6 +186,16 @@ class SchedulerInterface(ABC):
         not yet returned in SchedulerOutputs."""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        """Return scheduler state relevant to idle-time cold reconfiguration."""
+        raise NotImplementedError
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        """Update the active per-iteration token budget while idle."""
+        raise NotImplementedError
+
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:

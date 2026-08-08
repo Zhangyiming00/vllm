@@ -99,11 +99,18 @@ class Scheduler(SchedulerInterface):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.max_num_batched_tokens_capacity = (
+            self.scheduler_config.max_num_batched_tokens
+        )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
-            else self.scheduler_config.max_num_batched_tokens
+            else self.max_num_batched_tokens_capacity
         )
+        self._scheduled_token_capacity_delta = (
+            self.max_num_batched_tokens_capacity - self.max_num_scheduled_tokens
+        )
+        self.active_max_num_batched_tokens = self.max_num_batched_tokens_capacity
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -264,6 +271,108 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+    @property
+    def _active_max_num_scheduled_tokens(self) -> int:
+        """Token budget the scheduler may issue in one iteration.
+
+        ``max_num_scheduled_tokens`` can be smaller than
+        ``max_num_batched_tokens`` when vLLM reserves slots for tokens appended
+        by speculative decoding. Preserve that capacity delta when the active
+        MBT is reduced, so the runner's total batch still fits the immutable
+        capacity buffers.
+        """
+        return max(
+            1,
+            self.active_max_num_batched_tokens
+            - self._scheduled_token_capacity_delta,
+        )
+
+    def _kv_pool_capacity_tokens(self) -> int:
+        additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+        explicit_capacity = additional_config.get("sae_capture_kv_pool_capacity_tokens")
+        if explicit_capacity is not None:
+            return int(explicit_capacity)
+
+        capture_batch_size = additional_config.get("sae_capture_batch_size")
+        capture_context_size = additional_config.get("sae_capture_context_size")
+        if capture_batch_size and capture_context_size:
+            return int(capture_batch_size) * int(capture_context_size)
+
+        num_gpu_blocks = self.cache_config.num_gpu_blocks
+        if num_gpu_blocks is not None:
+            return int(num_gpu_blocks) * int(self.block_size)
+
+        return self.max_num_batched_tokens_capacity
+
+    def _is_cold_reconfigure_idle(self) -> bool:
+        finished_req_ids_dict_idle = not any(
+            self.finished_req_ids_dict.values()
+        ) if self.finished_req_ids_dict is not None else True
+        return (
+            not self.waiting
+            and not self.running
+            and not self.requests
+            and not self.finished_req_ids
+            and finished_req_ids_dict_idle
+            and self.num_waiting_for_streaming_input == 0
+            and not self.finished_recving_kv_req_ids
+            and not self.failed_recving_kv_req_ids
+        )
+
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+        return {
+            "cold_reconfigure_enabled": bool(
+                additional_config.get("sae_allow_cold_reconfigure", False)
+            ),
+            "max_num_batched_tokens_capacity": self.max_num_batched_tokens_capacity,
+            "active_max_num_batched_tokens": self.active_max_num_batched_tokens,
+            "active_max_num_scheduled_tokens": self._active_max_num_scheduled_tokens,
+            "kv_pool_capacity_tokens": self._kv_pool_capacity_tokens(),
+            "engine_idle": self._is_cold_reconfigure_idle(),
+            "num_waiting_requests": len(self.waiting),
+            "num_running_requests": len(self.running),
+            "num_tracked_requests": len(self.requests),
+            "num_finished_request_ids_pending_clear": len(self.finished_req_ids),
+        }
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        value = int(value)
+        if value < 1:
+            raise ValueError(
+                "active max_num_batched_tokens must be >= 1; "
+                f"got {value}."
+            )
+        if value > self.max_num_batched_tokens_capacity:
+            raise ValueError(
+                "active max_num_batched_tokens cannot exceed immutable "
+                f"capacity {self.max_num_batched_tokens_capacity}; got {value}."
+            )
+        if (
+            value < self.max_model_len
+            and not self.scheduler_config.enable_chunked_prefill
+        ):
+            raise ValueError(
+                "Cannot set active max_num_batched_tokens below max_model_len "
+                f"({self.max_model_len}) when chunked prefill is disabled."
+            )
+
+        status_before = self.get_cold_reconfigure_status()
+        if not status_before["engine_idle"]:
+            raise RuntimeError(
+                "Cold reconfigure requires an idle scheduler with no waiting "
+                "or running requests; current status: "
+                f"{status_before}."
+            )
+
+        old = self.active_max_num_batched_tokens
+        self.active_max_num_batched_tokens = value
+        status_after = self.get_cold_reconfigure_status()
+        status_after["old_active_max_num_batched_tokens"] = old
+        return status_after
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -333,7 +442,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        token_budget = self._active_max_num_scheduled_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -348,6 +457,7 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        active_max_num_scheduled_tokens = self._active_max_num_scheduled_tokens
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -831,7 +941,7 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        assert total_num_scheduled_tokens <= active_max_num_scheduled_tokens
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs

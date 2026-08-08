@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
@@ -103,6 +104,88 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     assert len(scheduler.running) == len(requests)
     for i, request in enumerate(requests):
         assert scheduler.running[i] == request
+
+
+def test_active_max_num_batched_tokens_initial_state():
+    scheduler = create_scheduler(max_num_batched_tokens=16384)
+
+    assert scheduler.max_num_batched_tokens_capacity == 16384
+    assert scheduler.active_max_num_batched_tokens == 16384
+    status = scheduler.get_cold_reconfigure_status()
+    assert status["max_num_batched_tokens_capacity"] == 16384
+    assert status["active_max_num_batched_tokens"] == 16384
+    assert status["engine_idle"] is True
+
+
+def test_active_max_num_batched_tokens_controls_schedule_budget():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16384,
+        max_model_len=16384,
+        enable_chunked_prefill=True,
+    )
+    result = scheduler.set_active_max_num_batched_tokens(4096)
+    assert result["old_active_max_num_batched_tokens"] == 16384
+    assert result["active_max_num_batched_tokens"] == 4096
+
+    request = create_requests(num_requests=1, num_tokens=8192)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.total_num_scheduled_tokens == 4096
+    assert scheduler.max_num_batched_tokens_capacity == 16384
+    assert scheduler.max_num_scheduled_tokens == 16384
+
+
+def test_input_batch_capacity_remains_immutable_when_active_mbt_changes():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16384,
+        max_model_len=16384,
+        enable_chunked_prefill=True,
+    )
+    scheduler.set_active_max_num_batched_tokens(4096)
+
+    input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=128,
+        max_num_batched_tokens=scheduler.max_num_batched_tokens_capacity,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=1024,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+
+    assert input_batch.max_num_batched_tokens == 16384
+    assert input_batch.block_table[0].max_num_batched_tokens == 16384
+    assert input_batch.block_table[0].slot_mapping.cpu.shape == (16384,)
+    assert scheduler.active_max_num_batched_tokens == 4096
+
+
+@pytest.mark.parametrize("value", [0, -1, 16385])
+def test_active_max_num_batched_tokens_rejects_invalid_values(value: int):
+    scheduler = create_scheduler(max_num_batched_tokens=16384)
+
+    with pytest.raises(ValueError):
+        scheduler.set_active_max_num_batched_tokens(value)
+
+
+def test_active_max_num_batched_tokens_requires_idle_scheduler():
+    scheduler = create_scheduler(max_num_batched_tokens=16384)
+    scheduler.add_request(create_requests(num_requests=1, num_tokens=128)[0])
+
+    with pytest.raises(RuntimeError, match="idle"):
+        scheduler.set_active_max_num_batched_tokens(8192)
+
+
+def test_active_max_num_batched_tokens_requires_chunked_prefill_below_model_len():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16384,
+        max_model_len=8192,
+        enable_chunked_prefill=False,
+    )
+
+    with pytest.raises(ValueError, match="chunked prefill"):
+        scheduler.set_active_max_num_batched_tokens(scheduler.max_model_len - 1)
 
 
 def test_schedule_multimodal_requests():

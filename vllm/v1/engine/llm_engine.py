@@ -348,6 +348,35 @@ class LLMEngine:
             reset_running_requests, reset_connector
         )
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        status = self.engine_core.get_cold_reconfigure_status()
+        frontend_unfinished = self.output_processor.get_num_unfinished_requests()
+        status["frontend_unfinished_requests"] = frontend_unfinished
+        status["engine_idle"] = (
+            bool(status["engine_idle"])
+            and frontend_unfinished == 0
+            and not self.should_execute_dummy_batch
+        )
+        return status
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        status_before = self.get_cold_reconfigure_status()
+        frontend_unfinished = int(status_before["frontend_unfinished_requests"])
+        if frontend_unfinished != 0 or self.should_execute_dummy_batch:
+            raise RuntimeError(
+                "Cold reconfigure requires LLMEngine to be idle with no "
+                "unfinished frontend outputs; current status: "
+                f"{status_before}."
+            )
+        result = self.engine_core.set_active_max_num_batched_tokens(value)
+        status_after = self.get_cold_reconfigure_status()
+        status_after["old_active_max_num_batched_tokens"] = result[
+            "old_active_max_num_batched_tokens"
+        ]
+        return status_after
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

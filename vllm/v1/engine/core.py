@@ -548,6 +548,61 @@ class EngineCore:
         if self.scheduler:
             self.scheduler.shutdown()
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        status = self.scheduler.get_cold_reconfigure_status()
+        in_flight_batches = len(self.batch_queue) if self.batch_queue is not None else 0
+        status["in_flight_batches"] = in_flight_batches
+        status["engine_idle"] = bool(status["engine_idle"]) and in_flight_batches == 0
+        return status
+
+    def _drain_finished_request_cleanup_for_cold_reconfigure(self) -> None:
+        while self.scheduler.has_finished_requests() or bool(self.batch_queue):
+            if self.scheduler.has_unfinished_requests():
+                raise RuntimeError(
+                    "Cannot drain scheduler cleanup while unfinished requests "
+                    "are still present."
+                )
+            outputs, model_executed = self.step_fn()
+            self.post_step(model_executed)
+            if outputs:
+                live_outputs = [
+                    output
+                    for engine_outputs in outputs.values()
+                    for output in engine_outputs.outputs
+                ]
+                if live_outputs:
+                    raise RuntimeError(
+                        "Cannot prove engine is idle: draining finished-request "
+                        f"cleanup produced request outputs: {live_outputs}."
+                    )
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        self._drain_finished_request_cleanup_for_cold_reconfigure()
+        status_before = self.get_cold_reconfigure_status()
+        if not status_before["engine_idle"]:
+            raise RuntimeError(
+                "Cold reconfigure requires an idle engine with no waiting "
+                "requests, running requests, or in-flight batches; current "
+                f"status: {status_before}."
+            )
+
+        result = self.scheduler.set_active_max_num_batched_tokens(value)
+        status_after = self.get_cold_reconfigure_status()
+        status_after["old_active_max_num_batched_tokens"] = result[
+            "old_active_max_num_batched_tokens"
+        ]
+        logger.info(
+            "[COLD RECONFIGURE] active MBT %s -> %s, capacity=%s, "
+            "pool_capacity=%s",
+            status_after["old_active_max_num_batched_tokens"],
+            status_after["active_max_num_batched_tokens"],
+            status_after["max_num_batched_tokens_capacity"],
+            status_after["kv_pool_capacity_tokens"],
+        )
+        return status_after
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
 

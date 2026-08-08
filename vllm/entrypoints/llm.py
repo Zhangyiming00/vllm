@@ -409,6 +409,20 @@ class LLM:
     def get_tokenizer(self) -> TokenizerLike:
         return self.llm_engine.get_tokenizer()
 
+    def get_cold_reconfigure_status(self) -> dict[str, object]:
+        """Return idle-time cold reconfiguration state for this LLM."""
+        return self.llm_engine.get_cold_reconfigure_status()
+
+    def set_active_max_num_batched_tokens(
+        self, value: int
+    ) -> dict[str, object]:
+        """Update the active scheduler MBT while the engine is idle.
+
+        This does not resize model-runner or KV-cache capacity buffers. The
+        immutable capacity remains the value used at engine construction.
+        """
+        return self.llm_engine.set_active_max_num_batched_tokens(value)
+
     def get_world_size(self, include_dp: bool = True) -> int:
         """Get the world size from the parallel config.
 

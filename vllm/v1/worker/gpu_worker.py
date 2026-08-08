@@ -373,9 +373,15 @@ class Worker(WorkerBase):
             # additional_config; fall back to max_num_batched_tokens when they
             # are absent (e.g. plain vLLM use of capture mode).
             additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+            explicit_capacity = additional_config.get(
+                "sae_capture_kv_pool_capacity_tokens"
+            )
             capture_batch_size = additional_config.get("sae_capture_batch_size")
             capture_context_size = additional_config.get("sae_capture_context_size")
-            if capture_batch_size and capture_context_size:
+            if explicit_capacity is not None:
+                required_tokens = int(explicit_capacity)
+                sizing_basis = "sae_capture_kv_pool_capacity_tokens"
+            elif capture_batch_size and capture_context_size:
                 required_tokens = int(capture_batch_size) * int(capture_context_size)
                 sizing_basis = "batch_size * context_size"
             else:
