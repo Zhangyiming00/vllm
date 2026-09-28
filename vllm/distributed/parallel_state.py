@@ -1086,10 +1086,14 @@ class GroupCoordinator:
 
     def destroy(self):
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            # Preinitialized non-member coordinators store None. Passing None
+            # to destroy_process_group destroys the caller's default world.
+            if self.device_group is not None:
+                torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            if self.cpu_group is not None:
+                torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.device_communicator is not None:
             self.device_communicator.destroy()
